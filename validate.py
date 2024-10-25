@@ -8,6 +8,7 @@ canonical PyTorch, standard Python style, and good performance. Repurpose as you
 Hacked together by Ross Wightman (https://github.com/rwightman)
 """
 import argparse
+import pandas as pd
 import csv
 import glob
 import json
@@ -34,6 +35,13 @@ try:
 except ImportError:
     has_apex = False
 
+has_native_amp = False
+try:
+    if getattr(torch.cuda.amp, 'autocast') is not None:
+        has_native_amp = True
+except AttributeError:
+    pass
+
 try:
     from functorch.compile import memory_efficient_fusion
     has_functorch = True
@@ -54,23 +62,10 @@ parser.add_argument('--dataset', metavar='NAME', default='',
                     help='dataset type + name ("<type>/<name>") (default: ImageFolder or ImageTar if empty)')
 parser.add_argument('--split', metavar='NAME', default='validation',
                     help='dataset split (default: validation)')
-parser.add_argument('--num-samples', default=None, type=int,
-                    metavar='N', help='Manually specify num samples in dataset split, for IterableDatasets.')
 parser.add_argument('--dataset-download', action='store_true', default=False,
                     help='Allow download of dataset for torch/ and tfds/ datasets that support it.')
-parser.add_argument('--class-map', default='', type=str, metavar='FILENAME',
-                    help='path to class to idx mapping file (default: "")')
-parser.add_argument('--input-key', default=None, type=str,
-                   help='Dataset key for input images.')
-parser.add_argument('--input-img-mode', default=None, type=str,
-                   help='Dataset image conversion mode for input images.')
-parser.add_argument('--target-key', default=None, type=str,
-                   help='Dataset key for target labels.')
-
 parser.add_argument('--model', '-m', metavar='NAME', default='dpn92',
                     help='model architecture (default: dpn92)')
-parser.add_argument('--pretrained', dest='pretrained', action='store_true',
-                    help='use pre-trained model')
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('-b', '--batch-size', default=256, type=int,
@@ -87,8 +82,6 @@ parser.add_argument('--crop-pct', default=None, type=float,
                     metavar='N', help='Input image center crop pct')
 parser.add_argument('--crop-mode', default=None, type=str,
                     metavar='N', help='Input image crop mode (squash, border, center). Model default if None.')
-parser.add_argument('--crop-border-pixels', type=int, default=None,
-                    help='Crop pixels from image border.')
 parser.add_argument('--mean', type=float, nargs='+', default=None, metavar='MEAN',
                     help='Override mean pixel value of dataset')
 parser.add_argument('--std', type=float,  nargs='+', default=None, metavar='STD',
@@ -97,12 +90,16 @@ parser.add_argument('--interpolation', default='', type=str, metavar='NAME',
                     help='Image resize interpolation type (overrides model)')
 parser.add_argument('--num-classes', type=int, default=None,
                     help='Number classes in dataset')
+parser.add_argument('--class-map', default='', type=str, metavar='FILENAME',
+                    help='path to class to idx mapping file (default: "")')
 parser.add_argument('--gp', default=None, type=str, metavar='POOL',
                     help='Global pool type, one of (fast, avg, max, avgmax, avgmaxc). Model default if None.')
 parser.add_argument('--log-freq', default=10, type=int,
                     metavar='N', help='batch logging frequency (default: 10)')
 parser.add_argument('--checkpoint', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
+parser.add_argument('--pretrained', dest='pretrained', action='store_true',
+                    help='use pre-trained model')
 parser.add_argument('--num-gpu', type=int, default=1,
                     help='Number of GPUS to use')
 parser.add_argument('--test-pool', dest='test_pool', action='store_true',
@@ -132,8 +129,7 @@ parser.add_argument('--fast-norm', default=False, action='store_true',
 parser.add_argument('--reparam', default=False, action='store_true',
                     help='Reparameterize model')
 parser.add_argument('--model-kwargs', nargs='*', default={}, action=ParseKwargs)
-parser.add_argument('--torchcompile-mode', type=str, default=None,
-                    help="torch.compile mode (default: None).")
+
 
 scripting_group = parser.add_mutually_exclusive_group()
 scripting_group.add_argument('--torchscript', default=False, action='store_true',
@@ -176,6 +172,7 @@ def validate(args):
             use_amp = 'apex'
             _logger.info('Validating in mixed precision with NVIDIA APEX AMP.')
         else:
+            assert has_native_amp, 'Please update PyTorch to a version with native AMP (or use APEX).'
             assert args.amp_dtype in ('float16', 'bfloat16')
             use_amp = 'native'
             amp_dtype = torch.bfloat16 if args.amp_dtype == 'bfloat16' else torch.float16
@@ -239,7 +236,7 @@ def validate(args):
     elif args.torchcompile:
         assert has_compile, 'A version of torch w/ torch.compile() is required for --compile, possibly a nightly.'
         torch._dynamo.reset()
-        model = torch.compile(model, backend=args.torchcompile, mode=args.torchcompile_mode)
+        model = torch.compile(model, backend=args.torchcompile)
     elif args.aot_autograd:
         assert has_functorch, "functorch is needed for --aot-autograd"
         model = memory_efficient_fusion(model)
@@ -253,10 +250,6 @@ def validate(args):
     criterion = nn.CrossEntropyLoss().to(device)
 
     root_dir = args.data or args.data_dir
-    if args.input_img_mode is None:
-        input_img_mode = 'RGB' if data_config['input_size'][0] == 3 else 'L'
-    else:
-        input_img_mode = args.input_img_mode
     dataset = create_dataset(
         root=root_dir,
         name=args.dataset,
@@ -264,10 +257,6 @@ def validate(args):
         download=args.dataset_download,
         load_bytes=args.tf_preprocessing,
         class_map=args.class_map,
-        num_samples=args.num_samples,
-        input_key=args.input_key,
-        input_img_mode=input_img_mode,
-        target_key=args.target_key,
     )
 
     if args.valid_labels:
@@ -293,7 +282,6 @@ def validate(args):
         num_workers=args.workers,
         crop_pct=crop_pct,
         crop_mode=data_config['crop_mode'],
-        crop_border_pixels=args.crop_border_pixels,
         pin_memory=args.pin_mem,
         device=device,
         tf_preprocessing=args.tf_preprocessing,
@@ -305,6 +293,7 @@ def validate(args):
     top5 = AverageMeter()
 
     model.eval()
+    pretrained_features = []
     with torch.no_grad():
         # warmup, reduce variability of first batch time, especially for comparing torchscript vs non
         input = torch.randn((args.batch_size,) + tuple(data_config['input_size'])).to(device)
@@ -323,7 +312,14 @@ def validate(args):
 
             # compute output
             with amp_autocast():
-                output = model(input)
+                #output = model(input)
+                features = model.forward_features(input)
+                pre_logits = model.forward_head(features, pre_logits=True)
+                output = model.head(pre_logits)
+                #rows = pd.DataFrame(pre_logits.cpu().numpy())
+                rows = pd.DataFrame(features.flatten(start_dim=1).cpu().numpy())
+                rows.insert(0, column="label", value=target.cpu().numpy())
+                pretrained_features.append(rows)
 
                 if valid_labels is not None:
                     output = output[:, valid_labels]
@@ -376,6 +372,9 @@ def validate(args):
 
     _logger.info(' * Acc@1 {:.3f} ({:.3f}) Acc@5 {:.3f} ({:.3f})'.format(
        results['top1'], results['top1_err'], results['top5'], results['top5_err']))
+    df = pd.concat(pretrained_features, ignore_index=True)               
+    df.to_csv("testv2_" + args.model + ".csv")
+
 
     return results
 
@@ -387,10 +386,8 @@ def _try_run(args, initial_batch_size):
     while batch_size:
         args.batch_size = batch_size * args.num_gpu  # multiply by num-gpu for DataParallel case
         try:
-            if 'cuda' in args.device and torch.cuda.is_available():
+            if torch.cuda.is_available() and 'cuda' in args.device:
                 torch.cuda.empty_cache()
-            elif "npu" in args.device and torch.npu.is_available():
-                torch.npu.empty_cache()
             results = validate(args)
             return results
         except RuntimeError as e:
