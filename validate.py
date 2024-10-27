@@ -342,6 +342,7 @@ def validate(args):
         
         # Log progress
         if batch_idx % args.log_freq == 0:
+            rate_avg = input.size(0) / batch_time.avg if batch_time.avg > 0 else 0  # Handle zero division
             _logger.info(
                 'Test: [{0:>4d}/{1}]  '
                 'Time: {batch_time.val:.3f}s ({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s)  '
@@ -351,7 +352,7 @@ def validate(args):
                     batch_idx,
                     len(loader),
                     batch_time=batch_time,
-                    rate_avg=input.size(0) / batch_time.avg,
+                    rate_avg=rate_avg,
                     loss=losses,
                     top1=top1,
                     top5=top5
@@ -363,6 +364,7 @@ def validate(args):
 
     # Concatenate all features and save to CSV
     all_features_df = pd.concat(pretrained_features, ignore_index=True)
+    print(all_features_df.shape)
     output_file = f"{args.model}_features.csv"
     all_features_df.to_csv(output_file, index=False)
     print(f"Features saved to {output_file}")
