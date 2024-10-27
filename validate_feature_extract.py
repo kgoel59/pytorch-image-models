@@ -8,12 +8,14 @@ canonical PyTorch, standard Python style, and good performance. Repurpose as you
 Hacked together by Ross Wightman (https://github.com/rwightman)
 """
 import argparse
+import pandas as pd
 import csv
 import glob
 import json
 import logging
 import os
 import time
+import numpy as np
 from collections import OrderedDict
 from contextlib import suppress
 from functools import partial
@@ -33,6 +35,13 @@ try:
     has_apex = True
 except ImportError:
     has_apex = False
+
+has_native_amp = False
+try:
+    if getattr(torch.cuda.amp, 'autocast') is not None:
+        has_native_amp = True
+except AttributeError:
+    pass
 
 try:
     from functorch.compile import memory_efficient_fusion
@@ -54,23 +63,10 @@ parser.add_argument('--dataset', metavar='NAME', default='',
                     help='dataset type + name ("<type>/<name>") (default: ImageFolder or ImageTar if empty)')
 parser.add_argument('--split', metavar='NAME', default='validation',
                     help='dataset split (default: validation)')
-parser.add_argument('--num-samples', default=None, type=int,
-                    metavar='N', help='Manually specify num samples in dataset split, for IterableDatasets.')
 parser.add_argument('--dataset-download', action='store_true', default=False,
                     help='Allow download of dataset for torch/ and tfds/ datasets that support it.')
-parser.add_argument('--class-map', default='', type=str, metavar='FILENAME',
-                    help='path to class to idx mapping file (default: "")')
-parser.add_argument('--input-key', default=None, type=str,
-                   help='Dataset key for input images.')
-parser.add_argument('--input-img-mode', default=None, type=str,
-                   help='Dataset image conversion mode for input images.')
-parser.add_argument('--target-key', default=None, type=str,
-                   help='Dataset key for target labels.')
-
 parser.add_argument('--model', '-m', metavar='NAME', default='dpn92',
                     help='model architecture (default: dpn92)')
-parser.add_argument('--pretrained', dest='pretrained', action='store_true',
-                    help='use pre-trained model')
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('-b', '--batch-size', default=256, type=int,
@@ -87,8 +83,6 @@ parser.add_argument('--crop-pct', default=None, type=float,
                     metavar='N', help='Input image center crop pct')
 parser.add_argument('--crop-mode', default=None, type=str,
                     metavar='N', help='Input image crop mode (squash, border, center). Model default if None.')
-parser.add_argument('--crop-border-pixels', type=int, default=None,
-                    help='Crop pixels from image border.')
 parser.add_argument('--mean', type=float, nargs='+', default=None, metavar='MEAN',
                     help='Override mean pixel value of dataset')
 parser.add_argument('--std', type=float,  nargs='+', default=None, metavar='STD',
@@ -97,12 +91,16 @@ parser.add_argument('--interpolation', default='', type=str, metavar='NAME',
                     help='Image resize interpolation type (overrides model)')
 parser.add_argument('--num-classes', type=int, default=None,
                     help='Number classes in dataset')
+parser.add_argument('--class-map', default='', type=str, metavar='FILENAME',
+                    help='path to class to idx mapping file (default: "")')
 parser.add_argument('--gp', default=None, type=str, metavar='POOL',
                     help='Global pool type, one of (fast, avg, max, avgmax, avgmaxc). Model default if None.')
 parser.add_argument('--log-freq', default=10, type=int,
                     metavar='N', help='batch logging frequency (default: 10)')
 parser.add_argument('--checkpoint', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
+parser.add_argument('--pretrained', dest='pretrained', action='store_true',
+                    help='use pre-trained model')
 parser.add_argument('--num-gpu', type=int, default=1,
                     help='Number of GPUS to use')
 parser.add_argument('--test-pool', dest='test_pool', action='store_true',
@@ -132,8 +130,7 @@ parser.add_argument('--fast-norm', default=False, action='store_true',
 parser.add_argument('--reparam', default=False, action='store_true',
                     help='Reparameterize model')
 parser.add_argument('--model-kwargs', nargs='*', default={}, action=ParseKwargs)
-parser.add_argument('--torchcompile-mode', type=str, default=None,
-                    help="torch.compile mode (default: None).")
+
 
 scripting_group = parser.add_mutually_exclusive_group()
 scripting_group.add_argument('--torchscript', default=False, action='store_true',
@@ -176,6 +173,7 @@ def validate(args):
             use_amp = 'apex'
             _logger.info('Validating in mixed precision with NVIDIA APEX AMP.')
         else:
+            assert has_native_amp, 'Please update PyTorch to a version with native AMP (or use APEX).'
             assert args.amp_dtype in ('float16', 'bfloat16')
             use_amp = 'native'
             amp_dtype = torch.bfloat16 if args.amp_dtype == 'bfloat16' else torch.float16
@@ -239,7 +237,7 @@ def validate(args):
     elif args.torchcompile:
         assert has_compile, 'A version of torch w/ torch.compile() is required for --compile, possibly a nightly.'
         torch._dynamo.reset()
-        model = torch.compile(model, backend=args.torchcompile, mode=args.torchcompile_mode)
+        model = torch.compile(model, backend=args.torchcompile)
     elif args.aot_autograd:
         assert has_functorch, "functorch is needed for --aot-autograd"
         model = memory_efficient_fusion(model)
@@ -253,10 +251,6 @@ def validate(args):
     criterion = nn.CrossEntropyLoss().to(device)
 
     root_dir = args.data or args.data_dir
-    if args.input_img_mode is None:
-        input_img_mode = 'RGB' if data_config['input_size'][0] == 3 else 'L'
-    else:
-        input_img_mode = args.input_img_mode
     dataset = create_dataset(
         root=root_dir,
         name=args.dataset,
@@ -264,10 +258,6 @@ def validate(args):
         download=args.dataset_download,
         load_bytes=args.tf_preprocessing,
         class_map=args.class_map,
-        num_samples=args.num_samples,
-        input_key=args.input_key,
-        input_img_mode=input_img_mode,
-        target_key=args.target_key,
     )
 
     if args.valid_labels:
@@ -293,7 +283,6 @@ def validate(args):
         num_workers=args.workers,
         crop_pct=crop_pct,
         crop_mode=data_config['crop_mode'],
-        crop_border_pixels=args.crop_border_pixels,
         pin_memory=args.pin_mem,
         device=device,
         tf_preprocessing=args.tf_preprocessing,
@@ -305,79 +294,103 @@ def validate(args):
     top5 = AverageMeter()
 
     model.eval()
-    with torch.no_grad():
-        # warmup, reduce variability of first batch time, especially for comparing torchscript vs non
-        input = torch.randn((args.batch_size,) + tuple(data_config['input_size'])).to(device)
+    pretrained_features = []  
+
+    # Register a hook to capture the output from the final layer before the head
+    def get_features(module, input, output):
+        global pretrain_features
+        # Flatten the output from the layer and append to the list
+        flattened_features = output.mean(dim=[2, 3]).cpu().detach().numpy()  # Assuming output is of shape [batch_size, 176, h, w]
+        pretrained_features.append(flattened_features)
+
+    # Register the hook on the `norm` layer
+    norm_layer = model.norm
+    hook = norm_layer.register_forward_hook(get_features)
+
+    # Perform a warmup pass
+    input = torch.randn((args.batch_size,) + tuple(data_config['input_size'])).to(device)
+    if args.channels_last:
+        input = input.contiguous(memory_format=torch.channels_last)
+    with torch.no_grad(), amp_autocast():
+        model(input)
+
+    # Extract features for each batch
+    end = time.time()
+    for batch_idx, (input, target) in enumerate(loader):
+        if args.no_prefetcher:
+            target = target.to(device)
+            input = input.to(device)
         if args.channels_last:
             input = input.contiguous(memory_format=torch.channels_last)
-        with amp_autocast():
-            model(input)
+        
+        with torch.no_grad(), amp_autocast():
+            # Run the forward pass (this will trigger the hook)
+            features = model.forward_features(input)
 
-        end = time.time()
-        for batch_idx, (input, target) in enumerate(loader):
-            if args.no_prefetcher:
-                target = target.to(device)
-                input = input.to(device)
-            if args.channels_last:
-                input = input.contiguous(memory_format=torch.channels_last)
-
-            # compute output
-            with amp_autocast():
-                output = model(input)
-
-                if valid_labels is not None:
-                    output = output[:, valid_labels]
-                loss = criterion(output, target)
-
-            if real_labels is not None:
-                real_labels.add_result(output)
-
-            # measure accuracy and record loss
+        # Measure accuracy and record loss if applicable
+        if valid_labels is not None:
+            output = model.head(features)  # Get logits if necessary
+            output = output[:, valid_labels]
+            loss = criterion(output, target)
             acc1, acc5 = accuracy(output.detach(), target, topk=(1, 5))
             losses.update(loss.item(), input.size(0))
             top1.update(acc1.item(), input.size(0))
             top5.update(acc5.item(), input.size(0))
-
-            # measure elapsed time
-            batch_time.update(time.time() - end)
-            end = time.time()
-
-            if batch_idx % args.log_freq == 0:
-                _logger.info(
-                    'Test: [{0:>4d}/{1}]  '
-                    'Time: {batch_time.val:.3f}s ({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s)  '
-                    'Loss: {loss.val:>7.4f} ({loss.avg:>6.4f})  '
-                    'Acc@1: {top1.val:>7.3f} ({top1.avg:>7.3f})  '
-                    'Acc@5: {top5.val:>7.3f} ({top5.avg:>7.3f})'.format(
-                        batch_idx,
-                        len(loader),
-                        batch_time=batch_time,
-                        rate_avg=input.size(0) / batch_time.avg,
-                        loss=losses,
-                        top1=top1,
-                        top5=top5
-                    )
+        
+        # Log progress
+        if batch_idx % args.log_freq == 0:
+            rate_avg = input.size(0) / batch_time.avg if batch_time.avg > 0 else 0  # Handle zero division
+            _logger.info(
+                'Test: [{0:>4d}/{1}]  '
+                'Time: {batch_time.val:.3f}s ({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s)  '
+                'Loss: {loss.val:>7.4f} ({loss.avg:>6.4f})  '
+                'Acc@1: {top1.val:>7.3f} ({top1.avg:>7.3f})  '
+                'Acc@5: {top5.val:>7.3f} ({top5.avg:>7.3f})'.format(
+                    batch_idx,
+                    len(loader),
+                    batch_time=batch_time,
+                    rate_avg=rate_avg,
+                    loss=losses,
+                    top1=top1,
+                    top5=top5
                 )
+            )
 
-    if real_labels is not None:
-        # real labels mode replaces topk values at the end
-        top1a, top5a = real_labels.get_accuracy(k=1), real_labels.get_accuracy(k=5)
-    else:
-        top1a, top5a = top1.avg, top5.avg
-    results = OrderedDict(
-        model=args.model,
-        top1=round(top1a, 4), top1_err=round(100 - top1a, 4),
-        top5=round(top5a, 4), top5_err=round(100 - top5a, 4),
-        param_count=round(param_count / 1e6, 2),
-        img_size=data_config['input_size'][-1],
-        crop_pct=crop_pct,
-        interpolation=data_config['interpolation'],
-    )
+    # Remove the hook after extraction
+    hook.remove()
 
-    _logger.info(' * Acc@1 {:.3f} ({:.3f}) Acc@5 {:.3f} ({:.3f})'.format(
-       results['top1'], results['top1_err'], results['top5'], results['top5_err']))
+    all_features_flattened = np.concatenate(pretrained_features, axis=0)  # Combine along the first axis
+    # Create a DataFrame from the combined features
+    all_features_df = pd.DataFrame(all_features_flattened)
+    print(all_features_df.shape)
+ 
+    # Save to CSV
+    output_file = f"{args.model}_features.csv"
+    all_features_df.to_csv(output_file, index=False)
+    print(f"Features saved to {output_file}")
+    
+    # if real_labels is not None:
+    #     # real labels mode replaces topk values at the end
+    #     top1a, top5a = real_labels.get_accuracy(k=1), real_labels.get_accuracy(k=5)
+    # else:
+    #     top1a, top5a = top1.avg, top5.avg
+    # results = OrderedDict(
+    #     model=args.model,
+    #     top1=round(top1a, 4), top1_err=round(100 - top1a, 4),
+    #     top5=round(top5a, 4), top5_err=round(100 - top5a, 4),
+    #     param_count=round(param_count / 1e6, 2),
+    #     img_size=data_config['input_size'][-1],
+    #     crop_pct=crop_pct,
+    #     interpolation=data_config['interpolation'],
+    # )
 
-    return results
+    # _logger.info(' * Acc@1 {:.3f} ({:.3f}) Acc@5 {:.3f} ({:.3f})'.format(
+    #    results['top1'], results['top1_err'], results['top5'], results['top5_err']))
+    # df = pd.concat(pretrained_features, ignore_index=True)               
+    # df.to_csv("testv2_" + args.model + ".csv")
+
+
+    return []]
 
 
 def _try_run(args, initial_batch_size):
@@ -387,10 +400,8 @@ def _try_run(args, initial_batch_size):
     while batch_size:
         args.batch_size = batch_size * args.num_gpu  # multiply by num-gpu for DataParallel case
         try:
-            if 'cuda' in args.device and torch.cuda.is_available():
+            if torch.cuda.is_available() and 'cuda' in args.device:
                 torch.cuda.empty_cache()
-            elif "npu" in args.device and torch.npu.is_available():
-                torch.npu.empty_cache()
             results = validate(args)
             return results
         except RuntimeError as e:
