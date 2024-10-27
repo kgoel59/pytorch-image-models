@@ -390,7 +390,7 @@ def validate(args):
     # df.to_csv("testv2_" + args.model + ".csv")
 
 
-    return []]
+    return []
 
 
 def _try_run(args, initial_batch_size):
