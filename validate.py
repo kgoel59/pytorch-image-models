@@ -300,9 +300,9 @@ def validate(args):
         global pretrain_features
         pretrain_features = output.cpu().detach().numpy()
 
-    # Attach hook to penultimate layer
-    penultimate_layer = list(model.children())[-2]
-    hook = penultimate_layer.register_forward_hook(get_features)
+    # Register the hook on the `norm` layer
+    norm_layer = model.norm
+    hook = norm_layer.register_forward_hook(get_features)
 
     # Perform warmup pass
     input = torch.randn((args.batch_size,) + tuple(data_config['input_size'])).to(device)
